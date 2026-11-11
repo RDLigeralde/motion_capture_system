@@ -40,6 +40,13 @@ bool ViconDriver::init() {
   fixed_frame_id = this->nh->declare_parameter<string>("fixed_frame_id", string("mocap"));
   timer_single_pub_freq = this->nh->declare_parameter<int>("timer_single_pub_freq", 1);
   timer_multi_pub_freq = this->nh->declare_parameter<int>("timer_multi_pub_freq", 1);
+  // false (default): every subject's odometry and the multi_odometry array are
+  // published as soon as their frame has been processed, one message per
+  // frame. true: the previous behaviour, republishing the latest data from the
+  // two wall timers above (which repeats or skips frames whenever the timer
+  // rate differs from the frame rate, and delays each sample by up to a timer
+  // period).
+  publish_on_timer = this->nh->declare_parameter<bool>("publish_on_timer", false);
 
   this->nh->get_parameter("server_address", server_address);
   this->nh->get_parameter("model_list", model_list);
@@ -50,6 +57,7 @@ bool ViconDriver::init() {
   this->nh->get_parameter("fixed_frame_id", fixed_frame_id);
   this->nh->get_parameter("timer_single_pub_freq", timer_single_pub_freq);
   this->nh->get_parameter("timer_multi_pub_freq", timer_multi_pub_freq);
+  this->nh->get_parameter("publish_on_timer", publish_on_timer);
 
   RCLCPP_INFO(this->nh->get_logger(), "Server Address: %s", server_address.c_str());
   RCLCPP_INFO(this->nh->get_logger(), "Model List:");
@@ -63,6 +71,7 @@ bool ViconDriver::init() {
   RCLCPP_INFO(this->nh->get_logger(), "Fixed Frame ID: %s", fixed_frame_id.c_str());
   RCLCPP_INFO(this->nh->get_logger(), "Timer Single Publisher Frequency: %d", timer_single_pub_freq);
   RCLCPP_INFO(this->nh->get_logger(), "Timer Multi Publisher Frequency: %d", timer_multi_pub_freq);
+  RCLCPP_INFO(this->nh->get_logger(), "Publish On: %s", publish_on_timer ? "Timers" : "Frame arrival");
 
   frame_interval = 1.0 / static_cast<double>(frame_rate);
   double& dt = frame_interval;
@@ -117,14 +126,17 @@ bool ViconDriver::init() {
   // Create publishers
   pub_multi = this->nh->create_publisher<OdometryArray>("multi_odometry", 10);
 
-  // Create timers to publish data
-  single_pub_timer = this->nh->create_wall_timer(
-    std::chrono::milliseconds(1000 / timer_single_pub_freq),
-    std::bind(&ViconDriver::publishSingleData, this));
+  // Create timers to publish data, only when asked to: by default each frame
+  // is published from handleFrame as it is processed.
+  if (publish_on_timer) {
+    single_pub_timer = this->nh->create_wall_timer(
+      std::chrono::milliseconds(1000 / timer_single_pub_freq),
+      std::bind(&ViconDriver::publishSingleData, this));
 
-  multi_pub_timer = this->nh->create_wall_timer(
-    std::chrono::milliseconds(1000 / timer_multi_pub_freq),
-    std::bind(&ViconDriver::publishMultiData, this));
+    multi_pub_timer = this->nh->create_wall_timer(
+      std::chrono::milliseconds(1000 / timer_multi_pub_freq),
+      std::bind(&ViconDriver::publishMultiData, this));
+  }
 
   return true;
 }
@@ -216,6 +228,24 @@ void ViconDriver::handleFrame() {
   boost::unique_lock<boost::shared_mutex> write_lock(odom_mtx);
   odometry_data = odometry_data_threads;
   write_lock.unlock();
+
+  // Publish this frame now: one odometry message per tracked subject and one
+  // multi_odometry array, each carrying the header stamp taken when the frame
+  // was received. A subject that produced no estimate this frame (occluded,
+  // initializing, or not in the model list) has an empty publisher and is
+  // left out, so nothing is ever published twice.
+  if (!publish_on_timer) {
+    OdometryArray odom_array_msg;
+    for (auto& odometry_pair : odometry_data_threads) {
+      if (odometry_pair.first) {
+        odometry_pair.first->publish(odometry_pair.second);
+        odom_array_msg.odom_array.push_back(odometry_pair.second);
+      }
+    }
+    if (!odom_array_msg.odom_array.empty()) {
+      pub_multi->publish(odom_array_msg);
+    }
+  }
 
   // Send out warnings
   for (auto it = subjects.begin(); it != subjects.end(); ++it) {

@@ -230,6 +230,9 @@ class MoCapDriverBase{
     int timer_single_pub_freq;
     int timer_multi_pub_freq;
 
+    // Publish from the wall timers (true) instead of on frame arrival (false)
+    bool publish_on_timer;
+
     rclcpp::Publisher<OdometryArray>::SharedPtr pub_multi;
 
     // no sign of this tf broadcaster object being used in cpp
